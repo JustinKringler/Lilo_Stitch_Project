@@ -1,0 +1,392 @@
+---
+title: "Random Forest: Overfitting With Lilo and Stitch"
+author: "Justin Kringler"
+output:  
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+
+
+The goal of this personal project is to explore one of my favorite childhood movies as well as cover how misleading an over-fitted Random Forest Model can be. I will be dividing this project into three sections: Analysis, Normalization, and Modeling. 
+
+For the analysis part of this project as well as the Random Forest Modeling part of this project, I will be using the transcript for Lilo and Stitch. To get this transcript, I had to web-scrape from "https://movies.fandom.com/wiki/Lilo_%26_Stitch/Transcript". The code to how I web-scraped this script is on my github: "https://github.com/JustinKringler/Lilo_Stitch_Project/blob/main/Stitch_Web_Scrape.R".
+
+
+
+  <center>
+Before we get into what will be done in each step, here is a little proof of my love for the Lilo and Stitch franchise to show I'm no fake fan.
+<br />
+<br />
+![text](me and stitch.png){width=30%}
+  </center>
+
+
+
+
+
+Part 1, The Analysis: The goal of the analysis of this script was to find interesting things to look out for before throwing the data into the Random Forest Model. Essentially, I was looking for things I needed to normalize.
+
+Part 2, Normalization and Cleaning: In this section, I applied normalization techniques to some of the data that I thought would be problematic for the model that was found through the analysis. Some of these techniques include getting rid of stop words, case sensitivities, noises characters make, outliers, etc.
+
+
+Part 3, Random Forest: In this section, we explore what happens when we run the Random Forest model with and without dividing the data into training and testing sets. These models will use the lines the characters said as the predictor, and the characters will be the response variable. We will have a total of four models. Two models predicting if Lilo said the line or not (one tested on data set, one tested on test set). The other two models predicting which character said which line (one tested on data set, one tested on test set).
+
+# Part 1: The Analysis
+
+Like any good Data Analysis, we need to bring in the big gun (dplyr), and the trusted sidekicks (the rest of the libraries).
+
+##### Libraries for Markdown
+```{r echo = T, message=FALSE,warning=FALSE}
+library(dplyr) #we love dplyr
+library(stringr) # For manipulation of strings
+library(tm) # To address "stopwords"
+library(qdapRegex) # To remove strings between brackets
+library(superml) # To label encode
+library(randomForest) #For Random Forest
+library(caTools) # For splitting data into test and training
+library(wordcloud) # For word cloud
+```
+
+Now that we brought our trusted friends to help us, we can now bring in the data that I web-scraped.
+
+##### Bringing in dataset
+```{r}
+Clean_Script <- read.csv(url("https://raw.githubusercontent.com/JustinKringler/Lilo_Stitch_Project/main/lilo_script.csv"), header = TRUE)
+```
+
+The data set has two columns: One called 'X1' that includes the character's name, and one column called 'X2' that includes the line they said. 
+
+The first thing I want to look at is how many different times in the movie each character was talking. It's important to note that this is not how many sentence each character had, but rather different moments they were speaking.
+
+##### Line count for top 10 characters
+```{r}
+temp<-Clean_Script %>% 
+  count(X1) %>%
+   arrange(desc(n))
+head(temp,10)
+```
+
+Next, I want to see how many characters (as in letters and such) were said by the top 10 characters. Then after this, we can see which Lilo and Stitch character says more characters per line.
+
+##### Letters said by top 10 characters
+```{r}
+temp1<-Clean_Script %>%
+  group_by(X1) %>%
+  summarise(Freq = sum(nchar(X2))) %>%
+  arrange(desc(Freq))
+head(temp1,10)
+```
+
+Now we are going to use the information from the first two and create a proportion to see who says more characters per line to look for any abnormalities.
+
+##### Characters/Lines proportion 
+```{r}
+temp2 <- merge(x=temp,y=temp1,by="X1")
+temp2$Prop <- temp2$Freq/temp2$n
+hist(temp2$Prop, main = "Histogram of Proportion (Nchar/Lines)",xlab = "(Nchar/Lines)",
+     col = "light blue")
+```
+ 
+We see that this is not remotely close to appearing normally distributed. I want to compare this proportion to the same proportion but with removing all lines that are longer than 150 characters.
+
+##### Creating new proportions/Comparing the two proportions
+```{r}
+tempp<-Clean_Script %>% 
+  filter(nchar(X2)<= 150) %>%
+  count(X1) %>%
+   arrange(desc(n))
+
+
+tempp1 <- Clean_Script %>%
+  group_by(X1) %>%
+  filter(nchar(X2)<= 150) %>%
+  summarise(Freq = sum(nchar(X2))) %>%
+  arrange(desc(Freq))
+
+tempp3 <- merge(x=tempp,y=tempp1,by="X1")
+tempp3$Prop <- tempp3$Freq/tempp3$n
+
+par(mfrow = c(1, 2))
+
+hist(temp2$Prop, main = "Old",xlab = "(Nchar/Lines)",
+     col = "light blue")
+
+hist(tempp3$Prop, main = "New",xlab = "(Nchar/Lines)",
+     col = "light green")
+
+```
+
+The histogram appears to resemble more of a normal distribution, but we will run the Shapiro test to make sure.
+
+##### Normalization Test
+```{r}
+shapiro.test(tempp3$Prop)
+```
+
+Since the P value is larger than .05, we can say it is a little closer to a perfect normal distribution. The previous histogram has a very small P Value, indicating that it is far from a normal distribution.
+
+Upon looking at this script, I see that whenever a character makes a noise, the noise is included with what the character said, enclosed in brackets. For example, let us look at stitches first 5 lines, as well as how many times this happens.
+
+##### First 5 Stitch lines and total occurances 
+```{r}
+head(Clean_Script$X2[which(Clean_Script$X1=="Stitch")])
+sum(nrow(Clean_Script[str_detect(Clean_Script$X2, "\\["), ]))
+
+```
+
+We do not want to include these noises in the model because it could be misleading. The goal of the model is to figure out which character is saying what, and that does not include noises they make. We will note this and fix this in the normalization step.
+
+The next step in the analysis is checking what are the most common words with and without stop words removed. This is important to show why we delete stop words.
+
+##### Most common words Including Stop words, no punctuation, or case sensitivity.
+```{r}
+new_script <- Clean_Script
+new_script$X2 <- tolower(new_script$X2)
+new_script$X2 <- str_replace_all(new_script$X2, "[[:punct:]]", "")
+list_script<- as.list(new_script$X2)
+list_script <- paste(list_script, collapse = '')
+freq_x <- sort(table(unlist(strsplit(list_script, " "))),      # Create frequency table
+               decreasing = TRUE)
+head(freq_x)
+```
+Essentially, all stop words are the top words. This will hurt the model and not help it accurately predict. Lets take a look at what the top words are after we get rid of stop words and punctuation.
+
+##### Most common words without including stopwords or punctuation
+```{r}
+
+list_script_nostop <- removeWords(list_script, words = stopwords(kind = "en"))
+freq_y <- sort(table(unlist(strsplit(list_script_nostop, " "))),      # Create frequency table
+               decreasing = TRUE)
+head(freq_y)
+```
+
+With how many words that were removed from the list, we now know it will be important to repeat this step in the normalization process.
+
+For fun, here is a wordcloud of some of our more popular words!
+```{r}
+wordcloud1<-as.data.frame(freq_y)
+wordcloud1 <- wordcloud1[-1,]
+wordcloud(words = wordcloud1$Var1, freq = wordcloud1$Freq, min.freq = 8, random.order=FALSE,scale=c(5,.5), rot.per=0.1,colors=brewer.pal(10, "Paired"))
+
+```
+
+
+# Part 2: Normalization and Cleaning
+The first thing we want to clean up is deleting all the script comments from the transcript. Essentially, we are getting rid of anytime the script picked up something that was happening in the movie but was not said by a character. 
+
+
+##### New dataset without Script Noise.
+```{r}
+new_script <- Clean_Script
+new_script<-new_script[!(new_script$X1=="Script"),]
+
+```
+
+Next, we are going to get rid of all times in the script noises were made and recorded into the script. These occurrences are enclosed by brackets or parenthesis.
+
+##### Getting rid of character noises.
+```{r}
+new_script$X2 <- rm_between(new_script$X2,"[","]")
+new_script$X2 <- rm_between(new_script$X2,"(",")")
+```
+
+
+```{r}
+# Before
+head(Clean_Script$X2[which(Clean_Script$X1=="Stitch")],1)
+# After
+head(new_script$X2[which(new_script$X1=="Stitch")],1)
+```
+
+Since there are some lines that were entirely noises, we will need to delete all blank lines.
+
+##### Deleting blank lines
+```{r}
+new_script<-new_script[!(new_script$X2==""),]
+
+```
+
+Now that we cleaned all that up, we will again reference back to our analysis and remove stop words, case sensitivity, and punctuation. I will be repeating the code just to have it under part 2 for reference.
+
+##### Most commonly used words before removing stop words
+```{r}
+new_script$X2 <- tolower(new_script$X2)
+
+list_script<- as.list(new_script$X2)
+list_script <- paste(list_script, collapse = '')
+
+list_script_nostop <- removeWords(list_script, words = stopwords(kind = "en"))
+
+new_script$X2 <- str_replace_all(new_script$X2, "[[:punct:]]", "")
+```
+
+Lastly, before we get to making the model, for simplicity we will only include the main characters.
+
+##### Deleting extra characters
+```{r}
+model_ready <- filter(new_script, X1 %in%  c("Lilo","Nani","Jumba","Pleakley",
+                                             "Gantu","Stitch"))
+```
+
+
+
+# Part 3: Random Forest
+
+The first step in building the random forest model will be to label encode for two different random forest models. The first one will be for predicting whether the character saying the line is either Lilo, or not Lilo. The second model will be for predicting which character said what.
+
+##### Label Encoding 
+```{r}
+set.seed(123)
+# Binary label encoding for Lilo
+model_ready$LE <- ifelse(model_ready$X1=="Lilo",1,0)
+
+#label encoding where each is unique
+label <- LabelEncoder$new()
+model_ready$ULE <- label$fit_transform(model_ready$X1)
+
+```
+
+Now that we label encoded for these two models, we can create the first random forest model for Lilo.
+
+#Random Forest for Binary Label Encoding
+```{r}
+model_ready$LE<-as.factor(model_ready$LE)
+
+RF_model <- randomForest(LE ~ X2, data=model_ready)
+model_ready$pred <- predict(RF_model, newdata=model_ready)
+
+# Confusion matrix
+table(model_ready$LE, model_ready$pred)
+
+#accuracy 
+a<-(sum(model_ready$pred==model_ready$LE))
+b<-(sum(model_ready$pred!=model_ready$LE))
+a/(a+b)
+
+```
+
+This model tells us that it was able to create an algorithm that could associate if the lines were said by Lilo or not with a 99.1% accuracy. 
+
+This could be very misleading. This is where the dangers of over-fitting come in. When not creating a testing and training set for your models, the accuracy only represents how successful the model was able to predict itself. 
+
+When using data that is finite and not large like this Lilo and Stitch script, it can be hard to use a testing and training set because no new lines can be generated, so breaking up the observations into a testing and training category really hurts the model.
+
+We will continue this example by now making the second random forest model but for predicting which character says which line.
+
+##### Second Random Forest Model (Predicting which characters said what)
+```{r}
+
+model_ready$ULE<-as.factor(model_ready$ULE)
+
+RF_model1 <- randomForest(ULE ~ X2, data=model_ready)
+model_ready$pred1 <- predict(RF_model1, newdata=model_ready)
+
+#accuracy 
+a<-(sum(model_ready$pred1==model_ready$ULE))
+b<-(sum(model_ready$pred1!=model_ready$ULE))
+a/(a+b)
+```
+
+Again our model has a really great probability of 98.8%, but is still over-fitted. I will now recreate these two models to show how the model would perform on a test set.
+
+
+##### Splitting the data into training and testing
+```{r}
+
+split <- sample.split(model_ready$LE, SplitRatio = 0.7)
+train_set <- subset(model_ready, split==TRUE)
+test_set <- subset(model_ready, split==FALSE)
+```
+
+Data is split lets redo what we did in the first model but with training and testing data
+
+#Random Forest for Lilo (including train/test)
+```{r}
+
+train_set$LE = as.factor(train_set$LE)
+test_set$LE = as.factor(test_set$LE )
+
+RF_model2 <- randomForest(LE ~ X2, data=train_set)
+predictRF <- predict(RF_model2, newdata=test_set)
+table(test_set$LE, predictRF)
+
+#accuracy 
+a<-(sum(test_set$LE==predictRF))
+b<-(sum(test_set$LE!=predictRF))
+a/(a+b)
+
+#Strategic guessing benchmark
+model_ready$LE<- as.numeric(model_ready$LE)
+a<-sum(model_ready$LE[which(model_ready$LE==2)])
+b<-nrow(model_ready)
+a/b
+```
+
+We were able to predict better than strategically guessing by about 4% with a successful rate of 58.5%. Nowhere near 99.4% but still better than guessing!
+
+Let us try again with the second model now with the same training and test sets.
+
+##### #Random Forest for predicting all characters (including train/test)
+```{r}
+
+train_set$ULE = factor(train_set$ULE)
+test_set$ULE = factor(test_set$ULE )
+
+RF_model3 <- randomForest(ULE ~ X2, data=train_set)
+predictRF = predict(RF_model3, newdata=test_set)
+
+#accuracy 
+a<-(sum(test_set$ULE==predictRF))
+b<-(sum(test_set$ULE!=predictRF))
+a/(a+b)
+
+#Strategic guessing benchmark (lilo/total because lilo has most lines)
+a<-length(model_ready$ULE[which(model_ready$ULE==4)])
+b<-nrow(model_ready)
+a/b
+```
+
+This time around we scored 9% lower than strategically guessing. We will now look at a little pi chart of both compared to each other to really see the difference.
+
+##### Pi charts comparing expected and reality.
+```{r}
+par(mfrow = c(1, 2))
+pie(c(1,99),c("","Expected "),main = "Predicting Lilo: Expected")
+pie(c(46,54),c("","Reality "),col = c("white","light green"),
+    main = "Predicting Lilo: Reality")
+par(mfrow = c(1, 2))
+pie(c(1.5,98.5),c("","Expected "),main = "Predicting All: Expected")
+pie(c(82,18),c("","Reality "),col = c("white","light green"),
+    main = "Predicting All: Reality")
+```
+
+
+The whole purpose of this was to show the dangers that can arise when not splitting data into training and testing sets, especially when using random forests with few predictors and observations. A false reality is created, which could be very damaging if this was for a real world situation. 
+
+Essentially running the model without testing and training sets just tells us how good of a model can be created to predict itself. But with training and testing data the model tells us if there is some patterns the model will pick up in the training set that can be applied to similar data (test set).
+
+# Takeaways/Findings
+
+* Random Forest Model performed between 98%-99% on the dataset for both Binary Label Encoding (Lilo) and Regular label Encoding
+
+* Random Forest Model performed about 54% on test set for Binary Label Encoding (Lilo) which was 4% better than the benchmark
+
+* Random Forest Model performed about 18% on the test set for Regular label Encoding which was 9% lower than the benchmark.
+
+* Lilo has the most lines, but Nani has more total characters in her lines.
+
+* After stop words were removed, Lilo was the most common name and word said.
+
+* Hammerhead Guard says the least amount in the movie with one line only containing 5 letters.
+
+
+
